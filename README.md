@@ -1,7 +1,7 @@
 # Image Processor
 **A self-contained, production-ready image processing service for S3-backed storage**
 
-> **Status:** 🚧 Planned - Development not yet started  
+> **Status:** 🚧 Planned - Development in progress
 > **License:** MIT  
 > **Language:** Go (planned)
 > **Container:** Docker
