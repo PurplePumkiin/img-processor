@@ -3,7 +3,7 @@
 
 > **Status:** 🚧 Planned - Development not yet started  
 > **License:** MIT  
-> **Language:** Go (planned) / Python (alternative)  
+> **Language:** Go (planned)
 > **Container:** Docker
 
 ---
@@ -13,7 +13,7 @@
 A lightweight, containerized image processing service designed to sit between web applications and S3 object storage. The processor fetches images from private S3 buckets, applies on-demand transformations (resize, compress, format conversion), strips privacy-sensitive EXIF metadata, and serves optimized images with aggressive caching for maximum CDN efficiency.
 
 **Built for developers who want:**
-- Private S3 buckets (no presigned URLs)
+- Private S3 compatible buckets (no presigned URLs)
 - On-demand image transformations via URL parameters
 - EXIF stripping for privacy
 - Cacheable, permanent URLs
@@ -25,7 +25,7 @@ A lightweight, containerized image processing service designed to sit between we
 ## Planned Capabilities
 
 ### Core Features (v1.0 MVP)
-- ✅ **S3 Integration** - Fetch from private S3 buckets (AWS S3 initially)
+- ✅ **S3 Integration** - Fetch from private S3 compatible buckets
 - ✅ **EXIF Stripping** - Remove metadata for privacy and size reduction
 - ✅ **Smart Caching** - Filesystem-based cache with automatic cleanup
 - ✅ **CDN-Friendly** - Immutable URLs with long cache headers
@@ -39,7 +39,6 @@ A lightweight, containerized image processing service designed to sit between we
 - 🔄 **Quality Control** - URL param: `?q=85` (0-100)
 - 🔄 **Format Conversion** - URL param: `?format=webp`
 - 🔄 **Redis Cache** - Faster distributed caching option
-- 🔄 **Multiple S3 Providers** - AWS, DigitalOcean Spaces, Wasabi, Backblaze B2
 - 🔄 **Custom Endpoints** - MinIO, self-hosted S3-compatible storage
 
 ### Production Features (v2.0+)
@@ -68,11 +67,11 @@ A lightweight, containerized image processing service designed to sit between we
 │   Browser   │
 └──────┬──────┘
        │ 1. Request image
-       │ https://img.pumkiin.tech/blog/images/2026/03/photo.jpg?w=800
+       │ https://image.example.com/myImage.jpg?w=800&q=85
        ▼
 ┌─────────────────┐
-│   CloudFlare    │ ← 2. Check CDN cache
-│   (CDN Edge)    │    Cache hit? → Serve immediately
+│   (CDN Edge)    │ ← 2. Check CDN cache
+│                 │    Cache hit? → Serve immediately
 └──────┬──────────┘    Cache miss? → Forward to origin
        │
        ▼
@@ -105,7 +104,7 @@ A lightweight, containerized image processing service designed to sit between we
 └─────────────┘    (Cached for 1 year)
 
 Next request for same URL:
-  → CloudFlare serves from edge (< 10ms)
+  → CDN serves from edge (< 10ms)
   → No processing, no S3 fetch
   → Infinite scalability
 ```
@@ -121,20 +120,20 @@ https://img.pumkiin.tech/blog/{s3-key}
 
 **Examples:**
 ```
-https://img.pumkiin.tech/blog/blog-images/2026/03/photo.jpg
-https://img.pumkiin.tech/blog/blog-images/2026/03/photo.jpg?w=800
-https://img.pumkiin.tech/blog/blog-images/2026/03/photo.jpg?w=400&q=75&format=webp
+https://img.pumkiin.tech/blog/blog-images/1970/01/photo.jpg
+https://img.pumkiin.tech/blog/blog-images/1970/01/photo.jpg?w=800
+https://img.pumkiin.tech/blog/blog-images/1970/01/photo.jpg?w=400&q=75&format=webp
 ```
 
 ### User Images (Private, Auth Required - v2.0+)
 ```
-https://img.pumkiin.tech/user/{s3-key}?token={jwt}
+https://img.pumkiin.tech/private/{s3-key}?token={jwt}
 ```
 
 **Examples:**
 ```
-https://img.pumkiin.tech/user/profile-pictures/user_123.jpg
-https://img.pumkiin.tech/user/avatars/user_456.jpg?w=200&token=eyJ...
+https://img.pumkiin.tech/private/profile-pictures/user_123.jpg?w=200&token=sHc...
+https://img.pumkiin.tech/private/avatars/user_456.jpg?w=200&token=eyJ...
 ```
 
 ### URL Parameters (v1.1+)
@@ -205,7 +204,7 @@ ENABLE_METRICS=true                  # Prometheus metrics endpoint
 
 ```bash
 # Pull image
-docker pull [username]/image-processor:latest
+docker pull PurplePumkiin/img-processor:latest
 
 # Run with environment variables
 docker run -d \
@@ -215,10 +214,10 @@ docker run -d \
   -e S3_SECRET_KEY=your_secret \
   -e S3_BUCKET=your-bucket \
   -e S3_REGION=us-east-1 \
-  [username]/image-processor:latest
+  PurplePumkiin/img-processor:latest
 
 # Test
-curl http://localhost:8080/blog/test-image.jpg
+curl http://localhost:8080/public/{s3-key}
 ```
 
 ### Using Docker Compose
@@ -226,8 +225,8 @@ curl http://localhost:8080/blog/test-image.jpg
 ```yaml
 version: '3.8'
 services:
-  image-processor:
-    image: [username]/image-processor:latest
+  img-processor:
+    image: PurplePumkiin/img-processor:latest
     ports:
       - "8080:8080"
     environment:
@@ -259,14 +258,14 @@ docker-compose down
 
 ```bash
 # Clone repository
-git clone https://github.com/[username]/image-processor
-cd image-processor
+git clone https://github.com/PurplePumkiin/img-processor
+cd img-processor
 
 # Build Docker image
-docker build -t image-processor:latest .
+docker build -t img-processor:latest .
 
 # Run
-docker run -p 8080:8080 --env-file .env image-processor:latest
+docker run -p 8080:8080 --env-file .env img-processor:latest
 ```
 
 ---
@@ -278,13 +277,13 @@ docker run -p 8080:8080 --env-file .env image-processor:latest
 // Upload to S3
 $s3Client->putObject([
     'Bucket' => 'my-bucket',
-    'Key' => 'blog-images/2026/03/image.jpg',
+    'Key' => 'blog-images/1970/01/test.jpg',
     'SourceFile' => $file['tmp_name'],
     'ACL' => 'private'  // Keep private!
 ]);
 
 // Return image processor URL (not S3 URL)
-$imageUrl = 'https://img.pumkiin.tech/blog/blog-images/2026/03/image.jpg';
+$imageUrl = 'https://img.pumkiin.tech/blog/blog-images/1970/01/test.jpg';
 
 // Store in database
 $stmt->execute([':image_url' => $imageUrl]);
@@ -293,7 +292,7 @@ $stmt->execute([':image_url' => $imageUrl]);
 ### HTML Usage
 ```html
 <!-- Original size -->
-<img src="https://img.pumkiin.tech/blog/blog-images/2026/03/photo.jpg" 
+<img src="https://img.pumkiin.tech/blog/blog-images/1970/01/test.jpg" 
      alt="Blog post image">
 
 <!-- Responsive sizes (v1.1+) -->
@@ -354,8 +353,7 @@ fetch(imageUrl, { method: 'HEAD' })
 
 ### Docker Image Size
 - **Go:** 20-50MB (multi-stage build)
-- **Python:** 500-800MB (with dependencies)
-- **Startup Time:** < 1 second (Go), 2-3 seconds (Python)
+- **Startup Time:** < 1 second
 
 ---
 
@@ -405,10 +403,10 @@ fetch(imageUrl, { method: 'HEAD' })
 ## Technical Stack (Planned)
 
 ### Core
-- **Language:** Go (or Python as fallback)
-- **HTTP Server:** net/http (Go) or FastAPI (Python)
-- **Image Library:** disintegration/imaging (Go) or Pillow (Python)
-- **S3 SDK:** aws-sdk-go-v2 (Go) or boto3 (Python)
+- **Language:** Go
+- **HTTP Server:** net/http
+- **Image Library:** disintegration/imaging
+- **S3 SDK:** aws-sdk-go-v2
 
 ### Dependencies (Go)
 ```go
@@ -418,21 +416,11 @@ github.com/joho/godotenv                 // .env support
 github.com/gin-gonic/gin                 // HTTP framework (optional)
 ```
 
-### Dependencies (Python)
-```python
-fastapi        # Async HTTP framework
-uvicorn        # ASGI server
-pillow         # Image processing
-boto3          # S3 client
-python-dotenv  # .env support
-redis          # Cache (optional)
-```
-
 ### Container
-- **Base Image:** Alpine Linux (Go) or Python Slim
-- **Size:** 20-50MB (Go) or 500MB (Python)
+- **Base Image:** Alpine Linux (Go)
+- **Size:** 20-50MB 
 - **Build:** Multi-stage Dockerfile
-- **Runtime:** Single binary (Go) or Python script
+- **Runtime:** Single binary
 
 ---
 
@@ -457,7 +445,7 @@ redis          # Cache (optional)
 - Run container as non-root user
 - Use read-only S3 credentials (GetObject only)
 - Keep S3 bucket private (Block Public Access = ON)
-- Enable CloudFlare DDoS protection
+- Enable DDoS protection
 - Monitor for abuse (metrics)
 - Regular security updates (Docker base image)
 
@@ -502,12 +490,12 @@ redis          # Cache (optional)
 ## Contributing (When Open-Sourced)
 
 We welcome contributions! Areas where help is needed:
-- 🐛 Bug reports and fixes
-- 📝 Documentation improvements
-- ✨ Feature requests and implementations
-- 🧪 Test coverage
-- 🌍 Translations
-- 📦 Package managers (Homebrew, apt, etc.)
+-  Bug reports and fixes
+-  Documentation improvements
+-  Feature requests and implementations
+-  Test coverage
+-  Translations
+-  Package managers (Homebrew, apt, etc.)
 
 **Contribution Guidelines:** Coming soon in CONTRIBUTING.md
 
@@ -518,7 +506,7 @@ We welcome contributions! Areas where help is needed:
 **MIT License** - Free for commercial and personal use
 
 ```
-Copyright (c) 2026 [Your Name]
+Copyright (c) 2026 Dennis
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -535,13 +523,13 @@ Full license: [LICENSE](LICENSE)
 
 ## Support
 
-**Status:** Project not yet started (planned)
+**Status:** Project not yet started (In Progress)
 
 Once released:
-- 📖 Documentation: [GitHub Wiki](coming-soon)
-- 🐛 Bug Reports: [GitHub Issues](coming-soon)
-- 💬 Discussions: [GitHub Discussions](coming-soon)  
-- 📧 Security Issues: [security@yourdomain.com](coming-soon)
+-  Documentation: [GitHub Wiki](coming-soon)
+-  Bug Reports: [GitHub Issues](coming-soon)
+-  Discussions: [GitHub Discussions](coming-soon)  
+-  Security Issues: [security@yourdomain.com](coming-soon)
 
 ---
 
