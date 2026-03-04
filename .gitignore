@@ -1,1 +1,28 @@
-documentation/private
+docs/private
+
+#Enviroments
+.env
+*.local
+
+#Caches
+cache/
+*.cache
+
+#Dependencies
+vendor/
+
+#IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+#Test data
+testData/
