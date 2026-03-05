@@ -1,7 +1,7 @@
 # Image Processor
 **A self-contained, production-ready image processing service for S3-backed storage**
 
-> **Status:** 🚧 Planned - Development in progress
+> **Status:** Development in progress
 > **License:** MIT  
 > **Language:** Go (planned)
 > **Container:** Docker
@@ -35,11 +35,11 @@ A lightweight, containerized image processing service designed to sit between we
 - ✅ **Error Handling** - Graceful failures, proper status codes
 
 ### Enhanced Features (v1.1+)
-- 🔄 **On-Demand Resizing** - URL params: `?w=800&h=600`
-- 🔄 **Quality Control** - URL param: `?q=85` (0-100)
-- 🔄 **Format Conversion** - URL param: `?format=webp`
+- ✅ **On-Demand Resizing** - URL params: `?w=800&h=600`
+- ✅ **Quality Control** - URL param: `?q=85` (0-100)
+- ✅ **Format Conversion** - URL param: `?format=webp`
 - 🔄 **Redis Cache** - Faster distributed caching option
-- 🔄 **Custom Endpoints** - MinIO, self-hosted S3-compatible storage
+- ✅ **Custom Endpoints** - MinIO, self-hosted S3-compatible storage
 
 ### Production Features (v2.0+)
 - 🔄 **Rate Limiting** - Per-IP request throttling
