@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  img-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: img-processor
+    ports:
+      - "8080:8080"
+    environment:
+      # Server config
+      - PORT=8080
+      
+      # S3 Configuration (from .env file)
+      - S3_ENDPOINT=${S3_ENDPOINT}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_REGION=${S3_REGION}
+      
+      # Processing config
+      - WIDTH_MAX=${WIDTH_MAX:-4096}
+      - HEIGHT_MAX=${HEIGHT_MAX:-4096}
+      - DEFAULT_QUALITY=${DEFAULT_QUALITY:-85}
+      
+      # Cache config
+      - CACHE_TTL_SECONDS=${CACHE_TTL_SECONDS:-3600}
+      - MAX_CACHE_SIZE_MB=${MAX_CACHE_SIZE_MB:-100}
+    restart: unless-stopped
+    
+    # Optional: Add health check
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

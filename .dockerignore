@@ -1,0 +1,37 @@
+# Git files
+.git
+.gitignore
+
+# Environment files (NEVER include in image - use docker-compose or -e flags)
+.env
+.env.local
+.env.*.local
+
+# Documentation
+README.md
+LICENSE
+docs/
+
+# Development files
+testData/
+*.log
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+img-processor
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker files (don't need these inside the image)
+Dockerfile
+.dockerignore
+docker-compose.yml
