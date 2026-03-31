@@ -2,34 +2,36 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/md5"
+	"fmt"
 	"image"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
-	"context"
-	"io"
-	"crypto/md5"
-	"fmt"
-	"time"
 	"sync"
+	"time"
 
-	"github.com/disintegration/imaging"
-	"github.com/joho/godotenv"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/disintegration/imaging"
+	"github.com/joho/godotenv"
 )
+
 // Memory CacheEntry struct for in memory caching
 type CacheEntry struct {
-	Data	  []byte
+	Data      []byte
 	createdAt time.Time
 }
 
 var (
-	imageCache   = make(map[string]*CacheEntry)
+	imageCache     = make(map[string]*CacheEntry)
 	cacheMutex     sync.RWMutex
 	totalCacheSize int64
 
@@ -58,7 +60,7 @@ func main() {
 	maxCacheSize = int64(maxCacheSizeMB) * 1024 * 1024
 
 	log.Printf("cache Configured: TTL=%v, MaxSize=%dMB\n", cacheTTL, maxCacheSizeMB)
-	
+
 	// Setup S3 Client
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithRegion(os.Getenv("S3_REGION")),
@@ -71,13 +73,10 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to load S3 config", err)
 	}
-	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options){
+	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(os.Getenv("S3_ENDPOINT"))
 		o.UsePathStyle = true
 	})
-
-
-
 
 	http.HandleFunc("/public/", func(w http.ResponseWriter, r *http.Request) {
 		handleImage(w, r, s3Client)
@@ -105,6 +104,22 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 	}
 
 	imgKey := strings.TrimPrefix(r.URL.Path, "/public/")
+
+	// Security: Validate path to prevent directory traversal attacks
+	imgKey = path.Clean(imgKey)
+	if strings.Contains(imgKey, "..") || strings.HasPrefix(imgKey, "/") || strings.HasPrefix(imgKey, "\\") {
+		log.Printf("Security: Blocked directory traversal attempt: %s", imgKey)
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	if imgKey == "." || imgKey == "" {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+
+	// Always access files under public/ prefix in S3 bucket
+	imgKey = "public/" + imgKey
+
 	query := r.URL.Query()
 
 	// Fetch query params for manipulation
@@ -145,7 +160,7 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 			w.Header().Set("ETag", hash)
 			w.Header().Set("Expires", time.Now().Add(365*24*time.Hour).UTC().Format(http.TimeFormat))
 			w.Write(entry.Data)
-			return 
+			return
 		}
 	}
 	cacheMutex.RUnlock()
