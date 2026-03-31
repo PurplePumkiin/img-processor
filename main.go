@@ -37,6 +37,7 @@ var (
 
 	cacheTTL     time.Duration
 	maxCacheSize int64
+	maxFileSize  int64 // Maximum file size to download from S3
 )
 
 func main() {
@@ -59,7 +60,17 @@ func main() {
 	}
 	maxCacheSize = int64(maxCacheSizeMB) * 1024 * 1024
 
-	log.Printf("cache Configured: TTL=%v, MaxSize=%dMB\n", cacheTTL, maxCacheSizeMB)
+	// Set max file size limit (default 50MB) to prevent memory exhaustion from large files
+	maxFileSizeMB, err := strconv.Atoi(os.Getenv("MAX_FILE_SIZE_MB"))
+	if err != nil {
+		maxFileSizeMB = 50 // fallback default max file size (MB)
+	}
+	maxFileSize = int64(maxFileSizeMB) * 1024 * 1024
+
+	log.Printf("cache Configured: TTL=%v, MaxSize=%dMB, MaxFileSize=%dMB\n", cacheTTL, maxCacheSizeMB, maxFileSizeMB)
+
+	// Start background goroutine to periodically clean up expired cache entries
+	go cacheCleanupWorker()
 
 	// Setup S3 Client
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
@@ -124,20 +135,29 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 
 	// Fetch query params for manipulation
 
+	// Validate width parameter: must be positive and within max limit
 	width, err := strconv.Atoi(query.Get("w"))
-	if err != nil || width > widthMax {
+	if err != nil || width > widthMax || width < 0 {
 		width = 0 // default width (no resizing)
 	}
+	// Validate height parameter: must be positive and within max limit
 	height, err := strconv.Atoi(query.Get("h"))
-	if err != nil || height > heightMax {
+	if err != nil || height > heightMax || height < 0 {
 		height = 0 // default height (no resizing)
 	}
+	// Validate quality parameter: must be between 1-100
 	quality, err := strconv.Atoi(query.Get("q"))
 	if err != nil {
 		quality, err = strconv.Atoi(os.Getenv("DEFAULT_QUALITY")) // default quality
 		if err != nil {
 			quality = 85 // fallback default quality
 		}
+	}
+	// Clamp quality to valid JPEG range (1-100)
+	if quality < 1 {
+		quality = 1
+	} else if quality > 100 {
+		quality = 100
 	}
 
 	form := strings.ToLower(query.Get("f"))
@@ -166,8 +186,12 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 	cacheMutex.RUnlock()
 	log.Println("Cache miss for key:", cacheKey)
 
+	// Use context with timeout to prevent hanging on slow S3 responses
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Fetch and read image from S3
-	result, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+	result, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(os.Getenv("S3_BUCKET")),
 		Key:    aws.String(imgKey),
 	})
@@ -176,9 +200,24 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 		return
 	}
 	defer result.Body.Close()
-	fileData, err := io.ReadAll(result.Body)
+
+	// Check file size before downloading to prevent memory exhaustion
+	if result.ContentLength != nil && *result.ContentLength > maxFileSize {
+		log.Printf("File too large: %d bytes (max: %d)", *result.ContentLength, maxFileSize)
+		http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Use LimitReader to enforce max size even if ContentLength is not set
+	fileData, err := io.ReadAll(io.LimitReader(result.Body, maxFileSize+1))
 	if err != nil {
 		http.Error(w, "Error reading image data", http.StatusInternalServerError)
+		return
+	}
+	// Check if we hit the limit (file too large)
+	if int64(len(fileData)) > maxFileSize {
+		log.Printf("File exceeded size limit during read: %d bytes", len(fileData))
+		http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -215,21 +254,32 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 	resizedImg := imaging.Resize(img, width, height, imaging.Lanczos)
 	// Encode the manipulated image back to bytes
 	var buf bytes.Buffer
+	var encodeErr error
 	switch finalFormat {
 	case "jpeg", "jpg":
-		imaging.Encode(&buf, resizedImg, imaging.JPEG, imaging.JPEGQuality(quality))
+		encodeErr = imaging.Encode(&buf, resizedImg, imaging.JPEG, imaging.JPEGQuality(quality))
 	case "png":
-		imaging.Encode(&buf, resizedImg, imaging.PNG)
+		encodeErr = imaging.Encode(&buf, resizedImg, imaging.PNG)
 	case "gif":
-		imaging.Encode(&buf, resizedImg, imaging.GIF)
+		encodeErr = imaging.Encode(&buf, resizedImg, imaging.GIF)
 	default:
-		imaging.Encode(&buf, resizedImg, imaging.JPEG, imaging.JPEGQuality(quality))
+		encodeErr = imaging.Encode(&buf, resizedImg, imaging.JPEG, imaging.JPEGQuality(quality))
 		finalFormat = "jpeg" // default to jpeg if format is unrecognized
+	}
+	// Check for encoding errors to avoid serving corrupted data
+	if encodeErr != nil {
+		log.Printf("Error encoding image: %v", encodeErr)
+		http.Error(w, "Error processing image", http.StatusInternalServerError)
+		return
 	}
 	processedData := buf.Bytes()
 
-	// Hit Cache
+	// Add to cache with eviction if necessary
 	cacheMutex.Lock()
+	// Evict entries if cache is too large before adding new entry
+	for totalCacheSize+int64(len(processedData)) > maxCacheSize && len(imageCache) > 0 {
+		evictOldestCacheEntry()
+	}
 	imageCache[cacheKey] = &CacheEntry{
 		Data:      processedData,
 		createdAt: time.Now(),
@@ -256,6 +306,51 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 
 func getCacheKey(imgKey string, keyWidth, keyHeight, quality int, format string) string {
 	return fmt.Sprintf("%s_w%d_h%d_q%d_f%s", imgKey, keyWidth, keyHeight, quality, format)
+}
+
+// cacheCleanupWorker runs periodically to remove expired cache entries
+// This prevents memory leaks from expired entries staying in cache forever
+func cacheCleanupWorker() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cacheMutex.Lock()
+		expiredCount := 0
+		for key, entry := range imageCache {
+			if time.Since(entry.createdAt) > cacheTTL {
+				totalCacheSize -= int64(len(entry.Data))
+				delete(imageCache, key)
+				expiredCount++
+			}
+		}
+		cacheMutex.Unlock()
+		if expiredCount > 0 {
+			log.Printf("Cache cleanup: removed %d expired entries, total cache: %dMB\n", expiredCount, totalCacheSize/(1024*1024))
+		}
+	}
+}
+
+// evictOldestCacheEntry removes the oldest cache entry to make room for new ones
+// Must be called with cacheMutex locked
+func evictOldestCacheEntry() {
+	var oldestKey string
+	var oldestTime time.Time
+	first := true
+
+	for key, entry := range imageCache {
+		if first || entry.createdAt.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = entry.createdAt
+			first = false
+		}
+	}
+
+	if oldestKey != "" {
+		totalCacheSize -= int64(len(imageCache[oldestKey].Data))
+		delete(imageCache, oldestKey)
+		log.Printf("Cache eviction: removed oldest entry %s\n", oldestKey)
+	}
 }
 
 // handlePrivate is responsible for authenticated images, like profiles or account specific data.
