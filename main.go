@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"image"
 	"io"
@@ -14,7 +16,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -38,6 +43,15 @@ var (
 	cacheTTL     time.Duration
 	maxCacheSize int64
 	maxFileSize  int64 // Maximum file size to download from S3
+
+	bootTime    time.Time
+	requestsDB  *sql.DB
+	analyticsDB *sql.DB
+
+	totalBytesRead  atomic.Int64
+	totalBytesSent  atomic.Int64
+	totalCacheHits  atomic.Int64
+	totalRequests   atomic.Int64
 )
 
 func main() {
@@ -46,6 +60,15 @@ func main() {
 	if err != nil {
 		log.Println("Error loading .env file")
 	}
+
+	bootTime = time.Now()
+	log.Printf("Server booted at %s", bootTime.Format(time.RFC3339))
+
+	if err := initDatabases(); err != nil {
+		log.Fatal("Failed to initialize databases:", err)
+	}
+	defer requestsDB.Close()
+	defer analyticsDB.Close()
 
 	// Pull cache info and set up in-memory cache
 	cacheTTLseconds, err := strconv.Atoi(os.Getenv("CACHE_TTL_SECONDS"))
@@ -105,6 +128,10 @@ func main() {
 // These are the 3 major handlers for the server
 // handleImage is reponsible for pulling images, manipulating them, and sending them back.
 func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
+	requestTime := time.Now()
+	bytesRead := int64(0)
+	bytesSent := int64(0)
+
 	widthMax, err := strconv.Atoi(os.Getenv("WIDTH_MAX"))
 	if err != nil {
 		widthMax = 4096 // fallback default max width
@@ -172,6 +199,7 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 
 			// Cache hit, return cached image
 			log.Println("Cache hit for key:", cacheKey)
+			cacheHit := true
 
 			hash := fmt.Sprintf(`"%x"`, md5.Sum(entry.Data))
 			w.Header().Set("Content-Type", http.DetectContentType(entry.Data))
@@ -180,6 +208,10 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 			w.Header().Set("ETag", hash)
 			w.Header().Set("Expires", time.Now().Add(365*24*time.Hour).UTC().Format(http.TimeFormat))
 			w.Write(entry.Data)
+
+			bytesSent = int64(len(entry.Data))
+			logToDB(requestTime, bytesRead, bytesSent, cacheHit)
+			logToAnalytics(bytesRead, bytesSent, true)
 			return
 		}
 	}
@@ -207,6 +239,9 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 		http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	if result.ContentLength != nil {
+		bytesRead = *result.ContentLength
+	}
 
 	// Use LimitReader to enforce max size even if ContentLength is not set
 	fileData, err := io.ReadAll(io.LimitReader(result.Body, maxFileSize+1))
@@ -219,6 +254,9 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 		log.Printf("File exceeded size limit during read: %d bytes", len(fileData))
 		http.Error(w, "File too large", http.StatusRequestEntityTooLarge)
 		return
+	}
+	if bytesRead == 0 {
+		bytesRead = int64(len(fileData))
 	}
 
 	// Fetch original file info & define defaults
@@ -302,6 +340,10 @@ func handleImage(w http.ResponseWriter, r *http.Request, s3Client *s3.Client) {
 	// return the image
 	w.Write(processedData)
 	log.Println("Served image:", imgKey, "with width:", width, "height:", height, "quality:", quality)
+	bytesSent = int64(len(processedData))
+
+	logToDB(requestTime, bytesRead, bytesSent, false)
+	logToAnalytics(bytesRead, bytesSent, false)
 }
 
 func getCacheKey(imgKey string, keyWidth, keyHeight, quality int, format string) string {
@@ -353,6 +395,148 @@ func evictOldestCacheEntry() {
 	}
 }
 
+func initDatabases() error {
+	var err error
+
+	requestsDB, err = sql.Open("sqlite", "requests.db")
+	if err != nil {
+		return fmt.Errorf("open requests db: %w", err)
+	}
+	if _, err = requestsDB.Exec(`CREATE TABLE IF NOT EXISTS requests (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		request_time TEXT NOT NULL,
+		bytes_read INTEGER NOT NULL,
+		bytes_sent INTEGER NOT NULL,
+		cache_hit BOOLEAN NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create requests table: %w", err)
+	}
+
+	analyticsDB, err = sql.Open("sqlite", "analytics.db")
+	if err != nil {
+		return fmt.Errorf("open analytics db: %w", err)
+	}
+	if _, err = analyticsDB.Exec(`CREATE TABLE IF NOT EXISTS analytics (
+		date TEXT PRIMARY KEY,
+		bytes_read INTEGER NOT NULL DEFAULT 0,
+		bytes_sent INTEGER NOT NULL DEFAULT 0,
+		cache_hits INTEGER NOT NULL DEFAULT 0,
+		total_requests INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		return fmt.Errorf("create analytics table: %w", err)
+	}
+
+	return loadAnalyticsTotals()
+}
+
+func loadAnalyticsTotals() error {
+	var bytesRead, bytesSent, cacheHits, requests sql.NullInt64
+	err := analyticsDB.QueryRow(`SELECT
+		COALESCE(SUM(bytes_read), 0),
+		COALESCE(SUM(bytes_sent), 0),
+		COALESCE(SUM(cache_hits), 0),
+		COALESCE(SUM(total_requests), 0)
+		FROM analytics`).Scan(&bytesRead, &bytesSent, &cacheHits, &requests)
+	if err != nil {
+		return fmt.Errorf("load analytics totals: %w", err)
+	}
+
+	totalBytesRead.Store(bytesRead.Int64)
+	totalBytesSent.Store(bytesSent.Int64)
+	totalCacheHits.Store(cacheHits.Int64)
+	totalRequests.Store(requests.Int64)
+	return nil
+}
+
+func logToDB(requestTime time.Time, bytesRead int64, bytesSent int64, cacheHit bool) {
+	_, err := requestsDB.Exec(
+		`INSERT INTO requests (request_time, bytes_read, bytes_sent, cache_hit) VALUES (?, ?, ?, ?)`,
+		requestTime.Format(time.RFC3339), bytesRead, bytesSent, cacheHit,
+	)
+	if err != nil {
+		log.Printf("Failed to insert request log: %v", err)
+		return
+	}
+
+	cutoff := time.Now().Add(-90 * 24 * time.Hour).Format(time.RFC3339)
+	if _, err := requestsDB.Exec(`DELETE FROM requests WHERE request_time < ?`, cutoff); err != nil {
+		log.Printf("Failed to purge old request logs: %v", err)
+	}
+}
+
+func logToAnalytics(bytesRead int64, bytesSent int64, cacheHit bool) {
+	totalBytesRead.Add(bytesRead)
+	totalBytesSent.Add(bytesSent)
+	totalRequests.Add(1)
+	if cacheHit {
+		totalCacheHits.Add(1)
+	}
+
+	today := time.Now().Format("2006-01-02")
+	cacheHits := int64(0)
+	if cacheHit {
+		cacheHits = 1
+	}
+
+	_, err := analyticsDB.Exec(`INSERT INTO analytics (date, bytes_read, bytes_sent, cache_hits, total_requests)
+		VALUES (?, ?, ?, ?, 1)
+		ON CONFLICT(date) DO UPDATE SET
+			bytes_read = bytes_read + excluded.bytes_read,
+			bytes_sent = bytes_sent + excluded.bytes_sent,
+			cache_hits = cache_hits + excluded.cache_hits,
+			total_requests = total_requests + 1`,
+		today, bytesRead, bytesSent, cacheHits,
+	)
+	if err != nil {
+		log.Printf("Failed to update analytics: %v", err)
+	}
+}
+
+func cacheHitPercentage() float64 {
+	requests := totalRequests.Load()
+	if requests == 0 {
+		return 0
+	}
+	return float64(totalCacheHits.Load()) / float64(requests) * 100
+}
+
+func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("Failed to encode JSON response: %v", err)
+	}
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "okay",
+		"uptime": time.Since(bootTime).Seconds(),
+	})
+}
+
+func handleAnalytics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	bytesSent := totalBytesSent.Load()
+	bytesRead := totalBytesRead.Load()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":          "okay",
+		"bytesSent":       bytesSent,
+		"bytesSaved":      bytesSent - bytesRead,
+		"cachePercentage": cacheHitPercentage(),
+	})
+}
+
 // handlePrivate is responsible for authenticated images, like profiles or account specific data.
 func handlePrivate(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("This feature will be available in future updates..."))
@@ -361,10 +545,14 @@ func handlePrivate(w http.ResponseWriter, r *http.Request) {
 // handleAPI is responsible for telemetry. i.e server load, request info, ect.
 func handleAPI(w http.ResponseWriter, r *http.Request) {
 	apiPath := strings.TrimPrefix(r.URL.Path, "/api/")
-	if apiPath == "ping" {
+	switch apiPath {
+	case "health":
+		handleHealth(w, r)
+	case "analytics":
+		handleAnalytics(w, r)
+	case "ping":
 		w.Write([]byte("pong"))
-		return
-	} else {
-		w.Write([]byte("This feature will be available in future updates..."))
+	default:
+		http.NotFound(w, r)
 	}
 }
